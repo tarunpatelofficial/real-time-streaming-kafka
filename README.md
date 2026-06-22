@@ -54,13 +54,13 @@ batch_job.py (reads aggregated results)
 ---
 
 ## Project Structure
-real-time-streaming-kafka/
-├── docker-compose.yml    # Kafka, Zookeeper, PostgreSQL
-├── producer.py           # Fake order event generator
-├── spark_job.py          # Spark Structured Streaming job
-├── batch_job.py          # Spark batch analytics
-├── requirements.txt      # Python dependencies
-└── tmp/                  # Spark checkpoint directory (gitignored)
+real-time-streaming-kafka/  \
+├── docker-compose.yml    # Kafka, Zookeeper, PostgreSQL  \
+├── producer.py           # Fake order event generator  \
+├── spark_job.py          # Spark Structured Streaming job  \
+├── batch_job.py          # Spark batch analytics  \
+├── requirements.txt      # Python dependencies  \
+└── tmp/                  # Spark checkpoint directory (gitignored)  \
 
 ---
 
