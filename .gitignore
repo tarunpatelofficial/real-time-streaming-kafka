@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Spark
+tmp/
+*.crc
+
+# Ivy cache (Spark JAR downloads)
+.ivy2/
+
+# VS Code
+.vscode/
+
+# Environment
+*.env
