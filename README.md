@@ -4,7 +4,7 @@ A production-grade real-time data pipeline that simulates a live e-commerce orde
 
 ## Architecture
 producer.py → Kafka → spark_job.py → PostgreSQL \
-↓
+↓ \
 batch_job.py (reads aggregated results)
 
 **producer.py** — generates realistic fake e-commerce orders continuously. Maintains order lifecycle consistency — a user must place an order before cancelling or returning it, with the same order_id and amount across events.
