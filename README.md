@@ -3,7 +3,7 @@
 A production-grade real-time data pipeline that simulates a live e-commerce order stream, processes it using Apache Spark Structured Streaming, and stores aggregated results in PostgreSQL. Built as a learning project to understand streaming vs batch processing, event ordering, and fault tolerance patterns.
 
 ## Architecture
-producer.py → Kafka → spark_job.py → PostgreSQL
+producer.py → Kafka → spark_job.py → PostgreSQL \
 ↓
 batch_job.py (reads aggregated results)
 
