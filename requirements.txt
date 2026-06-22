@@ -1,0 +1,5 @@
+kafka-python==3.0.0
+psycopg2-binary==2.9.12
+py4j==0.10.9.7
+pyspark==3.5.0
+tzdata==2026.2
