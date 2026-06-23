@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, window, sum as spark_sum, count
+from pyspark.sql.functions import from_json, col, window, sum as spark_sum, count, to_json, struct
 from pyspark.sql.types import StructType, StringType, DoubleType, IntegerType
 import psycopg2
 import time
@@ -55,7 +55,20 @@ parsed_df = raw_df \
     .select("data.*") \
     .withColumn("ts", col("ts").cast("timestamp"))
 
-agg_df = parsed_df \
+good_df = parsed_df.filter(
+    col("order_id").isNotNull() &
+    col("amount").isNotNull() &
+    col("ts").isNotNull()
+)
+
+bad_df = parsed_df.filter(
+    col("order_id").isNull() |
+    col("amount").isNull() |
+    col("ts").isNull() |
+    col("status").isNull()
+)
+
+agg_df = good_df \
     .withWatermark("ts", "2 minutes") \
     .groupBy(window(col("ts"), "1 minute")) \
     .agg(
@@ -156,7 +169,19 @@ def write_to_postgres(batch_df, batch_id):
         print(f"Batch {batch_id} upserted after reconnection ({len(rows)} windows)")
 
 
+bad_df_kafka = bad_df.select(
+    to_json(struct("*")).alias("value")
+)
+
 get_connection()
+
+dlq_query = bad_df_kafka.writeStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", KAFKA_BROKER) \
+    .option("topic", "orders-dlq") \
+    .option("checkpointLocation", r"D:/real-time-streaming-kafka/tmp/dlq_checkpoint") \
+    .outputMode("append") \
+    .start()
 
 query = agg_df.writeStream \
     .foreachBatch(write_to_postgres) \
@@ -164,4 +189,4 @@ query = agg_df.writeStream \
     .outputMode("update") \
     .start()
 
-query.awaitTermination()
+spark.streams.awaitAnyTermination()
