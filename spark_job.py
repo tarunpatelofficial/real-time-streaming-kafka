@@ -27,6 +27,9 @@ spark = SparkSession.builder \
         "org.apache.spark.sql.execution.streaming.state.HDFSBackedStateStoreProvider") \
     .config("spark.driver.extraJavaOptions", "-Duser.timezone=Asia/Kolkata") \
     .config("spark.executor.extraJavaOptions", "-Duser.timezone=Asia/Kolkata") \
+    .config("spark.metrics.conf.*.sink.prometheusServlet.path", "/metrics/prometheus") \
+    .config("spark.metrics.conf", r"D:/real-time-streaming-kafka/metrics.properties") \
+    .config("spark.ui.prometheus.enabled", "true") \
     .getOrCreate()
 
 spark.conf.set("spark.sql.shuffle.partitions", "4")

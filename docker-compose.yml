@@ -18,11 +18,19 @@ services:
       - zookeeper
     ports:
       - "9092:9092"
+      - "9101:9101"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9999
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_OPTS: "-javaagent:/opt/jmx-exporter/jmx_prometheus_javaagent.jar=9101:/opt/jmx-exporter/kafka-jmx-config.yml"
+    volumes:
+      - ./monitoring/jmx_prometheus_javaagent.jar:/opt/jmx-exporter/jmx_prometheus_javaagent.jar
+      - ./monitoring/kafka-jmx-config.yml:/opt/jmx-exporter/kafka-jmx-config.yml
+      - kafka_data:/var/lib/kafka
 
   postgres:
     image: postgres:15
@@ -33,3 +41,33 @@ services:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: password
       POSTGRES_DB: pipeline
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command: >
+      --config.file=/etc/prometheus/prometheus.yml
+      --web.enable-lifecycle
+    depends_on:
+      - kafka
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  kafka_data:

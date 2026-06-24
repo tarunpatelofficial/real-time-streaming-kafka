@@ -1,0 +1,24 @@
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+rules:
+  - pattern: "kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec><>Count"
+    name: kafka_messages_in_total
+    type: COUNTER
+  - pattern: "kafka.server<type=BrokerTopicMetrics, name=BytesInPerSec><>Count"
+    name: kafka_bytes_in_total
+    type: COUNTER
+  - pattern: "kafka.server<type=BrokerTopicMetrics, name=BytesOutPerSec><>Count"
+    name: kafka_bytes_out_total
+    type: COUNTER
+  - pattern: "kafka.log<type=Log, name=LogEndOffset, topic=(.+), partition=(.+)><>Value"
+    name: kafka_log_end_offset
+    type: GAUGE
+    labels:
+      topic: "$1"
+      partition: "$2"
+  - pattern: "kafka.log<type=Log, name=LogStartOffset, topic=(.+), partition=(.+)><>Value"
+    name: kafka_log_start_offset
+    type: GAUGE
+    labels:
+      topic: "$1"
+      partition: "$2"
