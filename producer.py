@@ -54,6 +54,8 @@ producer = create_producer()
 
 while True:
     order = generate_order()
-    producer.send('orders', value=order)
+    producer.send('orders',
+                   key=str(order["user_id"]).encode('utf-8'),
+                   value=order)
     print(f"Sent: {order}")
     time.sleep(0.5)
