@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, window, sum as spark_sum, count, to_json, struct
-from pyspark.sql.types import StructType, StringType, DoubleType, IntegerType
+from pyspark.sql.functions import from_json, col, window, sum as spark_sum, count, to_json, struct, when
+from pyspark.sql.types import StructType, StringType, DoubleType, IntegerType, LongType, StructField
 import psycopg2
 import time
 
@@ -13,6 +13,8 @@ PG_CONN_PARAMS = {
     "user": "admin",
     "password": "password"
 }
+
+MODE = "cdc"  # switch between "direct" and "cdc"
 
 pg_conn = None
 CHECKPOINT_DIR = r"D:/real-time-streaming-kafka/tmp/spark_checkpoint"
@@ -45,18 +47,55 @@ schema = StructType() \
     .add("status", StringType()) \
     .add("ts", StringType())
 
-raw_df = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", KAFKA_BROKER) \
-    .option("subscribe", "orders") \
-    .option("startingOffsets", "latest") \
-    .load()
+order_schema = StructType() \
+    .add("order_id", StringType()) \
+    .add("user_id", IntegerType()) \
+    .add("amount", DoubleType()) \
+    .add("status", StringType()) \
+    .add("ts", LongType())
 
-parsed_df = raw_df \
-    .selectExpr("CAST(value AS STRING) as json_str") \
-    .select(from_json(col("json_str"), schema).alias("data")) \
-    .select("data.*") \
-    .withColumn("ts", col("ts").cast("timestamp"))
+debezium_schema = StructType()\
+    .add("payload", StructType()\
+        .add("after", order_schema)\
+        .add("op", StringType())
+    )
+
+if MODE == "direct":
+    raw_df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", KAFKA_BROKER) \
+        .option("subscribe", "orders") \
+        .option("startingOffsets", "latest") \
+        .load()
+
+    parsed_df = raw_df \
+        .selectExpr("CAST(value AS STRING) as json_str") \
+        .select(from_json(col("json_str"), schema).alias("data")) \
+        .select("data.*") \
+        .withColumn("ts", col("ts").cast("timestamp"))
+
+elif MODE == "cdc":
+    raw_df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", KAFKA_BROKER) \
+        .option("subscribe", "pgserver.public.orders") \
+        .option("startingOffsets", "latest") \
+        .load()
+
+    parsed_df = raw_df \
+        .selectExpr("CAST(value AS STRING) as json_str") \
+        .select(from_json(col("json_str"), debezium_schema).alias("msg")) \
+        .select(col("msg.payload.after").alias("data"), col("msg.payload.op").alias("op")) \
+        .filter(col("op") == "c") \
+        .select("data.*") \
+        .withColumn("ts", (col("ts") / 1000000).cast("timestamp"))
+    
+    all_parsed_df = raw_df\
+        .selectExpr("CAST(value AS STRING) as json_str") \
+        .select(from_json(col("json_str"), debezium_schema).alias("msg")) \
+        .select(col("msg.payload.after").alias("data"), col("msg.payload.op").alias("op")) \
+        .select("data.*") \
+        .withColumn("ts", (col("ts") / 1000000).cast("timestamp"))
 
 good_df = parsed_df.filter(
     col("order_id").isNotNull() &
@@ -83,6 +122,26 @@ agg_df = good_df \
         col("window.end").alias("window_end"),
         col("total_revenue"),
         col("order_count")
+    )
+
+analytics_df = all_parsed_df \
+    .withWatermark("ts", "2 minutes") \
+    .groupBy(window(col("ts"), "1 minute")) \
+    .agg(
+        spark_sum(when(col("status") == "placed", 1).otherwise(0)).alias("placed_count"),
+        spark_sum(when(col("status") == "shipped", 1).otherwise(0)).alias("shipped_count"),
+        spark_sum(when(col("status") == "delivered", 1).otherwise(0)).alias("delivered_count"),
+        spark_sum(when(col("status") == "cancelled", 1).otherwise(0)).alias("cancelled_count"),
+        spark_sum(when(col("status") == "returned", 1).otherwise(0)).alias("returned_count")
+    ) \
+    .select(
+        col("window.start").alias("window_start"),
+        col("window.end").alias("window_end"),
+        col("placed_count"),
+        col("shipped_count"),
+        col("delivered_count"),
+        col("cancelled_count"),
+        col("returned_count")
     )
 
 def get_connection():
@@ -171,6 +230,77 @@ def write_to_postgres(batch_df, batch_id):
         cur.close()
         print(f"Batch {batch_id} upserted after reconnection ({len(rows)} windows)")
 
+def write_analytics_to_postgres(batch_df, batch_id):
+    global pg_conn
+    rows = batch_df.collect()
+    if not rows:
+        return
+
+    conn = ensure_connection()
+    cur = conn.cursor()
+
+    try:
+        for row in rows:
+            cur.execute("""
+                INSERT INTO orders_analytics (
+                    window_start, window_end,
+                    placed_count, shipped_count, delivered_count,
+                    cancelled_count, returned_count
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (window_start, window_end)
+                DO UPDATE SET
+                    placed_count    = EXCLUDED.placed_count,
+                    shipped_count   = EXCLUDED.shipped_count,
+                    delivered_count = EXCLUDED.delivered_count,
+                    cancelled_count = EXCLUDED.cancelled_count,
+                    returned_count  = EXCLUDED.returned_count
+            """, (
+                row.window_start, row.window_end,
+                row.placed_count, row.shipped_count, row.delivered_count,
+                row.cancelled_count, row.returned_count
+            ))
+
+        conn.commit()
+        cur.close()
+        print(f"Analytics batch {batch_id} upserted ({len(rows)} windows)")
+
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        print(f"Connection lost mid-batch, retrying analytics batch {batch_id}...")
+        try:
+            conn.rollback()
+        except:
+            pass
+        cur.close()
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        for row in rows:
+            cur.execute("""
+                INSERT INTO orders_analytics (
+                    window_start, window_end,
+                    placed_count, shipped_count, delivered_count,
+                    cancelled_count, returned_count
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (window_start, window_end)
+                DO UPDATE SET
+                    placed_count    = EXCLUDED.placed_count,
+                    shipped_count   = EXCLUDED.shipped_count,
+                    delivered_count = EXCLUDED.delivered_count,
+                    cancelled_count = EXCLUDED.cancelled_count,
+                    returned_count  = EXCLUDED.returned_count
+            """, (
+                row.window_start, row.window_end,
+                row.placed_count, row.shipped_count, row.delivered_count,
+                row.cancelled_count, row.returned_count
+            ))
+
+        conn.commit()
+        cur.close()
+        print(f"Analytics batch {batch_id} upserted after reconnection ({len(rows)} windows)")
+
 
 bad_df_kafka = bad_df.select(
     to_json(struct("*")).alias("value")
@@ -191,5 +321,12 @@ query = agg_df.writeStream \
     .option("checkpointLocation", CHECKPOINT_DIR) \
     .outputMode("update") \
     .start()
+
+if MODE == "cdc":
+    analytics_query = analytics_df.writeStream \
+        .foreachBatch(write_analytics_to_postgres) \
+        .option("checkpointLocation", r"D:/real-time-streaming-kafka/tmp/analytics_checkpoint") \
+        .outputMode("update") \
+        .start()
 
 spark.streams.awaitAnyTermination()
