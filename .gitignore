@@ -11,8 +11,13 @@ tmp/
 # Ivy cache (Spark JAR downloads)
 .ivy2/
 
+# Flink JARs
+flink_jars/
+
 # VS Code
 .vscode/
 
 # Environment
 *.env
+
+Project_Handoff_Document.md
