@@ -1,10 +1,17 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, window, sum as spark_sum, count, to_json, struct, when
 from pyspark.sql.types import StructType, StringType, DoubleType, IntegerType, LongType, StructField
+from pyspark.sql.avro.functions import from_avro
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.serialization import SerializationContext, MessageField
+from datetime import datetime, timezone
+from collections import defaultdict
 import psycopg2
 import time
 
 KAFKA_BROKER = "localhost:9092"
+SCHEMA_REGISTRY_URL = "http://localhost:8081"
 
 PG_CONN_PARAMS = {
     "host": "localhost",
@@ -14,7 +21,7 @@ PG_CONN_PARAMS = {
     "password": "password"
 }
 
-MODE = "cdc"  # switch between "direct" and "cdc"
+MODE = "direct"  # switch between "direct" and "cdc"
 
 pg_conn = None
 CHECKPOINT_DIR = r"D:/real-time-streaming-kafka/tmp/spark_checkpoint"
@@ -60,6 +67,9 @@ debezium_schema = StructType()\
         .add("op", StringType())
     )
 
+sr_client = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
+avro_deserializer = AvroDeserializer(sr_client)
+
 if MODE == "direct":
     raw_df = spark.readStream \
         .format("kafka") \
@@ -68,11 +78,11 @@ if MODE == "direct":
         .option("startingOffsets", "latest") \
         .load()
 
-    parsed_df = raw_df \
-        .selectExpr("CAST(value AS STRING) as json_str") \
-        .select(from_json(col("json_str"), schema).alias("data")) \
-        .select("data.*") \
-        .withColumn("ts", col("ts").cast("timestamp"))
+    # parsed_df = raw_df \
+    #     .selectExpr("CAST(value AS STRING) as json_str") \
+    #     .select(from_avro(col("json_str"), schema).alias("data")) \
+    #     .select("data.*") \
+    #     .withColumn("ts", col("ts").cast("timestamp"))
 
 elif MODE == "cdc":
     raw_df = spark.readStream \
@@ -97,52 +107,53 @@ elif MODE == "cdc":
         .select("data.*") \
         .withColumn("ts", (col("ts") / 1000000).cast("timestamp"))
 
-good_df = parsed_df.filter(
-    col("order_id").isNotNull() &
-    col("amount").isNotNull() &
-    col("ts").isNotNull()
-)
-
-bad_df = parsed_df.filter(
-    col("order_id").isNull() |
-    col("amount").isNull() |
-    col("ts").isNull() |
-    col("status").isNull()
-)
-
-agg_df = good_df \
-    .withWatermark("ts", "2 minutes") \
-    .groupBy(window(col("ts"), "1 minute")) \
-    .agg(
-        spark_sum("amount").alias("total_revenue"),
-        count("order_id").alias("order_count")
-    ) \
-    .select(
-        col("window.start").alias("window_start"),
-        col("window.end").alias("window_end"),
-        col("total_revenue"),
-        col("order_count")
+    good_df = parsed_df.filter(
+        col("order_id").isNotNull() &
+        col("amount").isNotNull() &
+        col("ts").isNotNull()
     )
 
-analytics_df = all_parsed_df \
-    .withWatermark("ts", "2 minutes") \
-    .groupBy(window(col("ts"), "1 minute")) \
-    .agg(
-        spark_sum(when(col("status") == "placed", 1).otherwise(0)).alias("placed_count"),
-        spark_sum(when(col("status") == "shipped", 1).otherwise(0)).alias("shipped_count"),
-        spark_sum(when(col("status") == "delivered", 1).otherwise(0)).alias("delivered_count"),
-        spark_sum(when(col("status") == "cancelled", 1).otherwise(0)).alias("cancelled_count"),
-        spark_sum(when(col("status") == "returned", 1).otherwise(0)).alias("returned_count")
-    ) \
-    .select(
-        col("window.start").alias("window_start"),
-        col("window.end").alias("window_end"),
-        col("placed_count"),
-        col("shipped_count"),
-        col("delivered_count"),
-        col("cancelled_count"),
-        col("returned_count")
+    bad_df = parsed_df.filter(
+        col("order_id").isNull() |
+        col("amount").isNull() |
+        col("ts").isNull() |
+        col("status").isNull()
     )
+
+    agg_df = good_df \
+        .withWatermark("ts", "2 minutes") \
+        .groupBy(window(col("ts"), "1 minute")) \
+        .agg(
+            spark_sum("amount").alias("total_revenue"),
+            count("order_id").alias("order_count")
+        ) \
+        .select(
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            col("total_revenue"),
+            col("order_count")
+        )
+    
+    analytics_df = all_parsed_df \
+        .withWatermark("ts", "2 minutes") \
+        .groupBy(window(col("ts"), "1 minute")) \
+        .agg(
+            spark_sum(when(col("status") == "placed", 1).otherwise(0)).alias("placed_count"),
+            spark_sum(when(col("status") == "shipped", 1).otherwise(0)).alias("shipped_count"),
+            spark_sum(when(col("status") == "delivered", 1).otherwise(0)).alias("delivered_count"),
+            spark_sum(when(col("status") == "cancelled", 1).otherwise(0)).alias("cancelled_count"),
+            spark_sum(when(col("status") == "returned", 1).otherwise(0)).alias("returned_count")
+        ) \
+        .select(
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            col("placed_count"),
+            col("shipped_count"),
+            col("delivered_count"),
+            col("cancelled_count"),
+            col("returned_count")
+        )
+    
 
 def get_connection():
     global pg_conn
@@ -179,6 +190,108 @@ def ensure_connection():
     except (psycopg2.OperationalError, psycopg2.InterfaceError):
         print("Postgres connection lost, reconnecting...")
         return get_connection()
+    
+def process_avro_batch(batch_df, batch_id):
+    """
+    1. Collect raw Avro bytes from Kafka
+    2. Deserialize each message using AvroDeserializer
+    3. Separate good/bad rows
+    4. Aggregate good rows into 1-minute windows
+    5. Upsert into orders_agg in Postgres
+    """
+    rows = batch_df.select("value").collect()
+    if not rows:
+        return
+ 
+    good_rows = []
+    bad_rows = []
+ 
+    for row in rows:
+        raw_bytes = row["value"]
+        try:
+            # AvroDeserializer handles the 5-byte Confluent header automatically
+            order = avro_deserializer(
+                raw_bytes,
+                SerializationContext("orders", MessageField.VALUE)
+            )
+            if order is None:
+                bad_rows.append(order)
+                continue
+ 
+            # Validate required fields
+            if order.get("order_id") and order.get("amount") and order.get("ts"):
+                good_rows.append(order)
+            else:
+                bad_rows.append(order)
+ 
+        except Exception as e:
+            print(f"Deserialization error: {e}")
+            bad_rows.append({"raw": str(raw_bytes), "error": str(e)})
+ 
+    print(f"Batch {batch_id}: {len(good_rows)} good, {len(bad_rows)} bad")
+ 
+    if not good_rows:
+        return
+ 
+    windows = defaultdict(lambda: {"total_revenue": 0.0, "order_count": 0})
+ 
+    for order in good_rows:
+        # ts is an ISO string e.g. "2026-06-27T11:51:13.387048+05:30"
+        ts = datetime.fromisoformat(order["ts"])
+        ts_utc = ts.astimezone(timezone.utc)
+        # Floor to the nearest minute to form window_start
+        window_start = ts_utc.replace(second=0, microsecond=0)
+        window_end = window_start.replace(minute=window_start.minute + 1) \
+            if window_start.minute < 59 \
+            else window_start.replace(hour=window_start.hour + 1, minute=0)
+ 
+        key = (window_start, window_end)
+        windows[key]["total_revenue"] += order["amount"]
+        windows[key]["order_count"] += 1
+ 
+    # --- Write to Postgres ---
+    conn = ensure_connection()
+ 
+    try:
+        cur = conn.cursor()
+        for (window_start, window_end), agg in windows.items():
+            cur.execute("""
+                INSERT INTO orders_agg (window_start, window_end, total_revenue, order_count)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (window_start, window_end)
+                DO UPDATE SET
+                    total_revenue = orders_agg.total_revenue + EXCLUDED.total_revenue,
+                    order_count   = orders_agg.order_count   + EXCLUDED.order_count
+            """, (window_start, window_end, agg["total_revenue"], agg["order_count"]))
+ 
+        conn.commit()
+        cur.close()
+        print(f"Batch {batch_id} upserted ({len(windows)} windows)")
+ 
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        print(f"Connection lost mid-batch, retrying batch {batch_id}...")
+        try:
+            conn.rollback()
+        except:
+            pass
+ 
+        conn = get_connection()
+        cur = conn.cursor()
+ 
+        for (window_start, window_end), agg in windows.items():
+            cur.execute("""
+                INSERT INTO orders_agg (window_start, window_end, total_revenue, order_count)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (window_start, window_end)
+                DO UPDATE SET
+                    total_revenue = orders_agg.total_revenue + EXCLUDED.total_revenue,
+                    order_count   = orders_agg.order_count   + EXCLUDED.order_count
+            """, (window_start, window_end, agg["total_revenue"], agg["order_count"]))
+ 
+        conn.commit()
+        cur.close()
+        print(f"Batch {batch_id} upserted after reconnection ({len(windows)} windows)")
+
 
 def write_to_postgres(batch_df, batch_id):
     global pg_conn
@@ -302,27 +415,35 @@ def write_analytics_to_postgres(batch_df, batch_id):
         print(f"Analytics batch {batch_id} upserted after reconnection ({len(rows)} windows)")
 
 
-bad_df_kafka = bad_df.select(
-    to_json(struct("*")).alias("value")
-)
 
 get_connection()
 
-dlq_query = bad_df_kafka.writeStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", KAFKA_BROKER) \
-    .option("topic", "orders-dlq") \
-    .option("checkpointLocation", r"D:/real-time-streaming-kafka/tmp/dlq_checkpoint") \
-    .outputMode("append") \
-    .start()
-
-query = agg_df.writeStream \
-    .foreachBatch(write_to_postgres) \
-    .option("checkpointLocation", CHECKPOINT_DIR) \
-    .outputMode("update") \
-    .start()
+if MODE == "direct":
+    query = raw_df.writeStream \
+        .foreachBatch(process_avro_batch) \
+        .option("checkpointLocation", CHECKPOINT_DIR) \
+        .outputMode("append") \
+        .start()
 
 if MODE == "cdc":
+    bad_df_kafka = bad_df.select(
+        to_json(struct("*")).alias("value")
+    )
+
+    dlq_query = bad_df_kafka.writeStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", KAFKA_BROKER) \
+        .option("topic", "orders-dlq") \
+        .option("checkpointLocation", r"D:/real-time-streaming-kafka/tmp/dlq_checkpoint") \
+        .outputMode("append") \
+        .start()
+
+    query = agg_df.writeStream \
+        .foreachBatch(write_to_postgres) \
+        .option("checkpointLocation", CHECKPOINT_DIR) \
+        .outputMode("update") \
+        .start()
+    
     analytics_query = analytics_df.writeStream \
         .foreachBatch(write_analytics_to_postgres) \
         .option("checkpointLocation", r"D:/real-time-streaming-kafka/tmp/analytics_checkpoint") \
