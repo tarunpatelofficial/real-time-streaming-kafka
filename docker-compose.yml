@@ -75,6 +75,17 @@ services:
       OFFSET_STORAGE_TOPIC: debezium_offsets
       STATUS_STORAGE_TOPIC: debezium_status
 
+  debezium-init:
+    image: alpine:3.18
+    container_name: debezium-init
+    depends_on:
+      - debezium
+      - postgres
+    volumes:
+      - ./monitoring/debezium/register-connector.sh:/register-connector.sh
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl && /bin/sh /register-connector.sh"]
+    restart: "no"
+
   prometheus:
     image: prom/prometheus:v2.45.0
     container_name: prometheus
@@ -96,9 +107,14 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
     depends_on:
       - prometheus
 
 volumes:
   postgres_data:
   kafka_data:
+  grafana_data:

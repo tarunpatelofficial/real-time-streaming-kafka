@@ -21,7 +21,7 @@ PG_CONN_PARAMS = {
     "password": "password"
 }
 
-MODE = "direct"  # switch between "direct" and "cdc"
+MODE = "cdc"  # switch between "direct" and "cdc"
 
 pg_conn = None
 CHECKPOINT_DIR = r"D:/real-time-streaming-kafka/tmp/spark_checkpoint"
@@ -90,6 +90,7 @@ elif MODE == "cdc":
         .option("kafka.bootstrap.servers", KAFKA_BROKER) \
         .option("subscribe", "pgserver.public.orders") \
         .option("startingOffsets", "latest") \
+        .option("failOnDataLoss", "false") \
         .load()
 
     parsed_df = raw_df \
